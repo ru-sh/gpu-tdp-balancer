@@ -1,336 +1,322 @@
 import time
 import logging
-from pynvml import *
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from typing import List, Tuple, Optional
+from pynvml import (
+    nvmlInit, nvmlShutdown, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex,
+    nvmlDeviceGetName, nvmlDeviceGetPowerManagementLimitConstraints,
+    nvmlDeviceGetPowerManagementLimit, nvmlDeviceSetPowerManagementLimit,
+    nvmlDeviceGetUtilizationRates,
+    NVMLError
+)
 
 class GpuTdpBalancer:
     """
-    Dynamically balances TDP limits across multiple NVIDIA GPUs based on load.
+    Dynamically balances and sets GPU power (TDP) limits
+    based on current device utilization, within a max cluster TDP budget.
     """
+
     def __init__(self,
-                 gpu_max_tdp_total_w: int = 800,
-                 gpu_min_tdp_per_gpu_w: int = 100,
-                 gpu_active_level_percent: int = 20,
-                 gpu_passive_level_percent: int = 10,
-                 update_interval_sec: float = 1.0):
-        """
-        Initializes the GpuTdpBalancer.
+            gpu_max_tdp_total_w: int = 800,
+            gpu_min_tdp_per_gpu_w: int = 100,
+            gpu_active_level_percent: int = 20,
+            gpu_passive_level_percent: int = 10,
+            update_interval_sec: float = 1.0,
+        ) -> None:
+        self.max_total_tdp_w = gpu_max_tdp_total_w
+        self.min_tdp_w = gpu_min_tdp_per_gpu_w
+        self.active_level = gpu_active_level_percent
+        self.passive_level = gpu_passive_level_percent
+        self.interval = update_interval_sec
 
-        Args:
-            gpu_max_tdp_total_w: Maximum total TDP allowed across all GPUs (Watts).
-            gpu_min_tdp_per_gpu_w: Minimum TDP limit for any single GPU (Watts).
-            gpu_active_level_percent: GPU utilization (%) threshold to consider a GPU "active".
-            gpu_passive_level_percent: GPU utilization (%) threshold below which all GPUs must be
-                                       to enter the "passive" state.
-            update_interval_sec: How often to check and adjust TDP (seconds).
-        """
-        self.gpu_max_tdp_total_mw = gpu_max_tdp_total_w * 1000
-        self.gpu_min_tdp_per_gpu_mw = gpu_min_tdp_per_gpu_w * 1000
-        self.gpu_active_level = gpu_active_level_percent
-        self.gpu_passive_level = gpu_passive_level_percent
-        self.update_interval = update_interval_sec
+        self.running = True
+        self._nvml_initialized = False  # Track NVML state
+        self._last_state = None # Track balancer state for logging
+        self._last_target_limits = None # Track last *calculated* target limits for logging
+        self._init_nvml()
+        self._initialize_device_data()
 
-        self.handles = []
-        self.num_gpus = 0
-        self.gpu_max_tdp_limits_mw = {} # Store individual GPU max TDP limits {index: max_tdp_mw}
-        self.last_tdp_limits_mw = {} # Store last applied TDP limits {index: tdp_mw}
-
-        logging.info("Initializing GpuTdpBalancer...")
-        self._initialize_nvml()
-        self._initial_tdp_setup()
-        logging.info("Initialization complete.")
-
-    def _initialize_nvml(self):
-        """Initializes the NVML library and retrieves GPU handles."""
+    def _init_nvml(self) -> None:
         try:
             nvmlInit()
-            self.num_gpus = nvmlDeviceGetCount()
-            if self.num_gpus == 0:
-                logging.error("No NVIDIA GPUs found.")
-                raise RuntimeError("No NVIDIA GPUs found.")
+            self._nvml_initialized = True # Flag successful initialization
+            logging.info("NVML initialized successfully.")
+        except NVMLError as e:
+            logging.error(f"Failed to initialize NVML: {e}")
+            self._nvml_initialized = False
+            raise # Re-raise to be caught by main
 
-            logging.info(f"Found {self.num_gpus} GPUs.")
-
-            for i in range(self.num_gpus):
-                handle = nvmlDeviceGetHandleByIndex(i)
-                self.handles.append(handle)
-                # Enable persistence mode if possible (helps maintain settings) - requires root
-                try:
-                    nvmlDeviceSetPersistenceMode(handle, NVML_FEATURE_ENABLED)
-                    logging.debug(f"Set persistence mode for GPU {i}.")
-                except NVMLError as e:
-                     if e.value == NVML_ERROR_NOT_SUPPORTED:
-                         logging.warning(f"Persistence mode not supported for GPU {i}.")
-                     elif e.value == NVML_ERROR_NO_PERMISSION:
-                         logging.warning(f"No permission to set persistence mode for GPU {i}. Run as root/admin.")
-                     else:
-                         logging.warning(f"Could not set persistence mode for GPU {i}: {e}")
-
-                 # Get and store the maximum possible power limit for this GPU
-                try:
-                    max_limit_mw = nvmlDeviceGetPowerManagementLimitConstraints(handle)[1] # Max limit is the second element
-                    self.gpu_max_tdp_limits_mw[i] = max_limit_mw
-                    logging.info(f"GPU {i}: Max TDP Limit = {max_limit_mw / 1000:.1f} W")
-                except NVMLError as e:
-                     # Some cards might not support constraints query
-                     if e.value == NVML_ERROR_NOT_SUPPORTED:
-                        logging.warning(f"Could not query max power limit for GPU {i} (Not Supported). Falling back to default limit.")
-                        try:
-                            # Use the default limit as a fallback max
-                            default_limit_mw = nvmlDeviceGetPowerManagementDefaultLimit(handle)
-                            self.gpu_max_tdp_limits_mw[i] = default_limit_mw
-                            logging.info(f"GPU {i}: Using Default TDP Limit as Max = {default_limit_mw / 1000:.1f} W")
-                        except NVMLError as e_inner:
-                             logging.error(f"Could not query default power limit for GPU {i}: {e_inner}. Cannot manage this GPU.")
-                             raise RuntimeError(f"Failed to get power limits for GPU {i}") from e_inner
-                     else:
-                        logging.error(f"Could not query max power limit constraints for GPU {i}: {e}. Cannot manage this GPU.")
-                        raise RuntimeError(f"Failed to get power limit constraints for GPU {i}") from e
-
-            # Sanity check total max TDP vs sum of individual max TDPs
-            total_individual_max_tdp_mw = sum(self.gpu_max_tdp_limits_mw.values())
-            if self.gpu_max_tdp_total_mw > total_individual_max_tdp_mw:
-                logging.warning(f"Configured GPU_MAX_TDP_TOTAL ({self.gpu_max_tdp_total_mw / 1000:.1f}W) is higher than the sum of individual GPU max TDPs ({total_individual_max_tdp_mw / 1000:.1f}W). Clamping to the sum.")
-                self.gpu_max_tdp_total_mw = total_individual_max_tdp_mw
-
-            # Sanity check min TDP vs individual max TDPs
-            for i in range(self.num_gpus):
-                if self.gpu_min_tdp_per_gpu_mw > self.gpu_max_tdp_limits_mw[i]:
-                     logging.warning(f"Configured GPU_MIN_TDP_PER_GPU ({self.gpu_min_tdp_per_gpu_mw/1000:.1f}W) is higher than GPU {i}'s max TDP ({self.gpu_max_tdp_limits_mw[i]/1000:.1f}W). Clamping min TDP for this GPU to its max TDP.")
-                     # This doesn't change the global minimum, but logic later will respect the GPU's max
-
-        except NVMLError as error:
-            logging.error(f"Failed to initialize NVML: {error}")
-            raise RuntimeError("Failed to initialize NVML") from error
-
-    def _initial_tdp_setup(self):
-        """Sets the initial TDP limit evenly across all GPUs."""
-        if self.num_gpus == 0:
-            return
-
-        logging.info("Performing initial TDP setup...")
-        initial_tdp_per_gpu_mw = self.gpu_max_tdp_total_mw // self.num_gpus
-        new_limits = {}
-
-        # Calculate initial target, clamping between min_tdp and individual GPU max
-        for i in range(self.num_gpus):
-            target_tdp = max(self.gpu_min_tdp_per_gpu_mw, initial_tdp_per_gpu_mw)
-            target_tdp = min(target_tdp, self.gpu_max_tdp_limits_mw[i])
-            new_limits[i] = target_tdp
-
-        # Adjust if initial allocation exceeded total budget due to min/max clamping
-        current_total_mw = sum(new_limits.values())
-        excess_mw = current_total_mw - self.gpu_max_tdp_total_mw
-
-        if excess_mw > 0:
-            logging.warning(f"Initial TDP clamping resulted in exceeding total budget by {excess_mw / 1000:.1f}W. Reducing limits.")
-            # Reduce from GPUs that are currently above the minimum, starting with highest
-            sorted_indices = sorted(new_limits, key=new_limits.get, reverse=True)
-            for i in sorted_indices:
-                if excess_mw <= 0:
-                    break
-                reduction = min(excess_mw, new_limits[i] - self.gpu_min_tdp_per_gpu_mw)
-                if reduction > 0:
-                    new_limits[i] -= reduction
-                    excess_mw -= reduction
-
-            # If still excess (means min limits sum > total budget), log error, but proceed.
-            # The _set_tdp_limits logic should ultimately respect the total budget if implemented robustly,
-            # or the user needs to adjust their config.
-            if excess_mw > 0:
-                 logging.error(f"Could not meet total TDP budget even after reducing to minimums where possible. Remaining excess: {excess_mw / 1000:.1f}W. Check configuration (GPU_MAX_TDP_TOTAL vs GPU_MIN_TDP_PER_GPU * num_gpus). Applying best effort.")
-
-
-        logging.info(f"Setting initial TDP limits (mW): { {i: l/1000 for i, l in new_limits.items()} }")
-        self._set_tdp_limits(new_limits)
-
-
-    def _set_tdp_limits(self, target_limits_mw: dict):
-        """
-        Applies the target TDP limits (in mW) to the GPUs.
-
-        Args:
-            target_limits_mw: A dictionary {gpu_index: tdp_limit_mw}.
-        """
-        applied_something = False
-        for i, handle in enumerate(self.handles):
-            if i not in target_limits_mw:
-                logging.warning(f"No target TDP provided for GPU {i}. Skipping.")
-                continue
-
-            # Clamp again just to be safe, respecting individual max and configured min
-            limit_to_set = max(self.gpu_min_tdp_per_gpu_mw, target_limits_mw[i])
-            limit_to_set = min(limit_to_set, self.gpu_max_tdp_limits_mw[i])
-            limit_to_set = int(limit_to_set) # NVML expects integer mW
-
-            # Only set if the limit has actually changed
-            if i not in self.last_tdp_limits_mw or self.last_tdp_limits_mw[i] != limit_to_set:
-                try:
-                    nvmlDeviceSetPowerManagementLimit(handle, limit_to_set)
-                    self.last_tdp_limits_mw[i] = limit_to_set
-                    logging.debug(f"Set GPU {i} TDP limit to {limit_to_set / 1000:.1f} W")
-                    applied_something = True
-                except NVMLError as error:
-                    # Handle common errors
-                    if error.value == NVML_ERROR_NO_PERMISSION:
-                        logging.error(f"Permission denied to set power limit for GPU {i}. Run script as root/administrator.")
-                    elif error.value == NVML_ERROR_NOT_SUPPORTED:
-                        logging.error(f"Power management limit is not supported for GPU {i}.")
-                    else:
-                        logging.error(f"Failed to set power limit for GPU {i}: {error}")
-                    # Stop trying if we hit a permission error, likely applies to all
-                    if error.value == NVML_ERROR_NO_PERMISSION:
-                       raise RuntimeError("Permission denied to set power limits. Exiting.") from error
-            else:
-                logging.debug(f"GPU {i} TDP limit already at {limit_to_set / 1000:.1f} W. No change needed.")
-
-        if applied_something:
-            logging.info(f"Applied new TDP limits (W): { {k: v/1000 for k, v in self.last_tdp_limits_mw.items()} }")
-
-
-    def get_gpu_status(self) -> list[tuple[int, int]]:
-        """
-        Gets the current utilization status for all GPUs.
-
-        Returns:
-            A list of tuples: [(gpu_index, utilization_percent), ...]
-        """
-        status = []
-        for i, handle in enumerate(self.handles):
-            try:
-                util = nvmlDeviceGetUtilizationRates(handle)
-                status.append((i, util.gpu)) # util.gpu is the GPU core utilization
-            except NVMLError as error:
-                logging.error(f"Failed to get utilization for GPU {i}: {error}")
-                status.append((i, 0)) # Assume 0 utilization on error
-        return status
-
-    def run(self):
-        """Starts the main balancing loop."""
-        logging.info("Starting TDP balancing loop...")
+    def _initialize_device_data(self) -> None:
+        if not self._nvml_initialized:
+            raise RuntimeError("Cannot initialize device data: NVML not initialized.")
         try:
-            while True:
-                gpu_statuses = self.get_gpu_status() # List of (index, utilization)
-                logging.debug(f"Current GPU utilization: {gpu_statuses}")
+            self.gpu_count = nvmlDeviceGetCount()
+            if self.gpu_count == 0:
+                 raise RuntimeError("No NVIDIA GPUs detected by NVML.")
+            self.handles = [nvmlDeviceGetHandleByIndex(i) for i in range(self.gpu_count)]
+            self.device_names = [nvmlDeviceGetName(h) for h in self.handles]
+            # TDP limits (Watts)
+            self.tdp_limits: List[Tuple[int, int]] = []
+            for i, h in enumerate(self.handles):
+                try:
+                    limits_mw = nvmlDeviceGetPowerManagementLimitConstraints(h)
+                     # Ensure limits are valid (non-zero, min <= max)
+                    if limits_mw[0] <= 0 or limits_mw[1] <= 0 or limits_mw[0] > limits_mw[1]:
+                         logging.warning(f"GPU {i} ({self.device_names[i]}) reported invalid power limits: {limits_mw} mW. Check nvidia-smi.")
+                         # Fallback or raise error - using reported max as min for now, but this is dubious
+                         min_w = max(1, limits_mw[1] // 1000) # Use max as min if min is invalid/zero
+                         max_w = limits_mw[1] // 1000
+                         # Ensure min_tdp_w config isn't below this potentially odd hardware min
+                         self.min_tdp_w = max(self.min_tdp_w, min_w)
+                         logging.warning(f"Adjusted effective min TDP to {self.min_tdp_w}W due to hardware report.")
+                    else:
+                         min_w = limits_mw[0] // 1000
+                         max_w = limits_mw[1] // 1000
+                    self.tdp_limits.append( (min_w, max_w) )
+                except NVMLError as e:
+                     logging.error(f"Failed to get power constraints for GPU {i} ({self.device_names[i]}): {e}")
+                     raise # Re-raise critical initialization error
+            self.tdp_max: List[int] = [lim[1] for lim in self.tdp_limits]
+            self.tdp_min: List[int] = [lim[0] for lim in self.tdp_limits]
+            logging.info(f"Detected {self.gpu_count} GPUs: {self.device_names}")
+            logging.info(f"Hardware TDP ranges (W): {self.tdp_limits}")
+            logging.info(f"Configured Min TDP per GPU: {self.min_tdp_w}W")
+            logging.info(f"Configured Max Total TDP: {self.max_total_tdp_w}W")
 
-                active_gpus = []
-                all_passive = True
-                for index, util in gpu_statuses:
-                    if util >= self.gpu_active_level:
-                        active_gpus.append((index, util))
-                        all_passive = False # At least one is active
-                    elif util >= self.gpu_passive_level:
-                         all_passive = False # This one isn't passive enough for the "all passive" state
+        except NVMLError as e:
+            logging.error(f"NVML error during device data initialization: {e}")
+            self.shutdown() # Attempt cleanup
+            raise RuntimeError(f"NVML error initializing device data: {e}") from e
 
-                new_limits_mw = {}
+    def get_loads_and_limits(self) -> Tuple[List[int], List[int]]:
+        """Gets current GPU utilization (%) and power limits (W)."""
+        usages = []
+        cur_limits = []
+        for i, h in enumerate(self.handles):
+            try:
+                usages.append(nvmlDeviceGetUtilizationRates(h).gpu)
+                cur_limits.append(nvmlDeviceGetPowerManagementLimit(h) // 1000)
+            except NVMLError as e:
+                logging.error(f"Failed to get data for GPU {i} ({self.device_names[i]}): {e}")
+                # Re-raise to be caught by the run loop's handler
+                raise
+        return usages, cur_limits
 
-                if all_passive:
-                    # Scenario: All GPUs are below passive threshold - distribute evenly
-                    logging.debug("All GPUs are passive. Distributing TDP evenly.")
-                    base_tdp_per_gpu_mw = self.gpu_max_tdp_total_mw // self.num_gpus
-                    current_total_mw = 0
-                    temp_limits = {}
+    def set_tdp_limits(self, new_limits: List[int], cur_limits: List[int]) -> None:
+        """
+        Set new TDP limits for all GPUs, but only if the new value differs
+        from the current value and is within hardware constraints.
+        """
+        for idx, (h, target, min_hw, max_hw, name, current) in enumerate(
+            zip(self.handles, new_limits, self.tdp_min, self.tdp_max, self.device_names, cur_limits)
+        ):
+            # Clamp target value within hardware limits AND configured minimum
+            w = max(min(target, max_hw), min_hw, self.min_tdp_w)
 
-                    # Initial pass: set base TDP, clamped by individual min/max
-                    for i in range(self.num_gpus):
-                        limit = max(self.gpu_min_tdp_per_gpu_mw, base_tdp_per_gpu_mw)
-                        limit = min(limit, self.gpu_max_tdp_limits_mw[i])
-                        temp_limits[i] = limit
-                        current_total_mw += limit
+            if w == current:
+                logging.debug(f"No changes {name} (GPU {idx}) TDP: {w}W (Target: {target}W, HW Range: {min_hw}-{max_hw}W)")
+                continue  # No change needed for this GPU
 
-                    # Adjust if total exceeds budget (due to clamping)
-                    excess_mw = current_total_mw - self.gpu_max_tdp_total_mw
-                    if excess_mw > 0:
-                        logging.debug(f"Passive distribution exceeded budget by {excess_mw/1000:.1f}W. Reducing.")
-                        # Reduce from GPUs above minimum, proportionally could be complex,
-                        # simpler: reduce from highest clamped values first
-                        sorted_indices = sorted(temp_limits, key=temp_limits.get, reverse=True)
-                        for i in sorted_indices:
-                            if excess_mw <= 0: break
-                            reduction = min(excess_mw, temp_limits[i] - self.gpu_min_tdp_per_gpu_mw)
-                            if reduction > 0:
-                                temp_limits[i] -= reduction
-                                excess_mw -= reduction
+            try:
+                nvmlDeviceSetPowerManagementLimit(h, w * 1000)
+                logging.info(f"Set {name} (GPU {idx}) TDP: {w}W (Target: {target}W, HW Range: {min_hw}-{max_hw}W)")
+            except NVMLError as e:
+                # Log error but continue trying to set for other GPUs
+                logging.error(f"Failed to set TDP for {name} (GPU {idx}) to {w}W: {e}")
 
-                    new_limits_mw = temp_limits # Use the potentially adjusted limits
+    def active_split(self, usages: List[int]) -> List[int]:
+        """Assign TDP: min_tdp_w to low-usage GPUs, rest distributed proportionally by max TDP across active GPUs."""
+        active_indices = [i for i, u in enumerate(usages) if u >= self.active_level]
+        inactive_indices = [i for i, u in enumerate(usages) if u < self.active_level]
+
+        limits = [0] * self.gpu_count # Initialize limits list
+
+        # Assign minimum TDP to all inactive GPUs first
+        for i in inactive_indices:
+            limits[i] = self.min_tdp_w
+
+        # Calculate budget for active and set inactive to min_tdp_w first
+        total_inactive_min = len(inactive_indices) * self.min_tdp_w
+        tdp_budget_for_active = max(0, self.max_total_tdp_w - total_inactive_min)
+
+        if active_indices and tdp_budget_for_active > 0:
+            # Distribute remaining budget proportionally among active GPUs based on their max TDP
+            max_tdp_sum_active = sum(self.tdp_max[i] for i in active_indices)
+
+            if max_tdp_sum_active <= 0:
+                logging.warning("Sum of max TDP for active GPUs is zero. Assigning min TDP to all GPUs.")
+                for i in range(self.gpu_count):
+                    limits[i] = self.min_tdp_w
+            else:
+                # First set inactive GPUs to minimum
+                temp_limits = {}
+                for i in range(self.gpu_count):
+                    if i not in active_indices:
+                        limits[i] = self.min_tdp_w
+                    else:
+                        temp_limits[i] = 0
+
+                # Calculate proportional share for active GPUs using corrected budget
+                for i in active_indices:
+                    prop_share = int(tdp_budget_for_active * self.tdp_max[i] / max_tdp_sum_active)
+                    temp_limits[i] = max(self.min_tdp_w, prop_share)
+
+                current_total = sum(temp_limits.values())
+                if current_total > tdp_budget_for_active + total_inactive_min: # Check against original budget
+                    overbudget = current_total - (tdp_budget_for_active + total_inactive_min)
+                    reducible_sum = sum(max(0, temp_limits[i] - self.min_tdp_w) for i in active_indices)
+
+                    if reducible_sum > 0:
+                        # Reduce proportionally from active GPUs
+                        for i in active_indices:
+                            if temp_limits[i] > self.min_tdp_w:
+                                reduction = int(overbudget * (temp_limits[i] - self.min_tdp_w) / reducible_sum)
+                                limits[i] = max(self.min_tdp_w, temp_limits[i] - reduction)
+                        # Inactive already set correctly
+                    else:
+                        logging.warning("Active split budget overrun could not be corrected. All active GPUs at min TDP.")
+                        for i in range(self.gpu_count):
+                            if i in active_indices:
+                                limits[i] = self.min_tdp_w
+                            else:
+                                limits[i] = self.min_tdp_w # Ensure inactive also get min
 
                 else:
-                    # Scenario: Some GPUs are active - prioritize active GPUs
-                    logging.debug(f"Active GPUs detected: {[g[0] for g in active_gpus]}. Prioritizing TDP.")
-                    active_gpus.sort(key=lambda x: x[1], reverse=True) # Sort by utilization descending
+                    for i in temp_limits:  # Use calculated limits (already includes inactive mins)
+                        limits[i] = temp_limits[i]
+        else:
+            # No budget or no active GPUs - set everyone to min
+            for i in range(self.gpu_count):
+                limits[i] = self.min_tdp_w
 
-                    # Start by assigning minimum TDP to all GPUs
-                    for i in range(self.num_gpus):
-                        # Ensure min TDP doesn't exceed the GPU's max capability
-                        new_limits_mw[i] = min(self.gpu_min_tdp_per_gpu_mw, self.gpu_max_tdp_limits_mw[i])
-
-                    current_allocated_mw = sum(new_limits_mw.values())
-                    remaining_budget_mw = self.gpu_max_tdp_total_mw - current_allocated_mw
-
-                    if remaining_budget_mw < 0:
-                        # This implies sum of min TDPs > total budget. Log error.
-                         logging.error(f"Sum of minimum TDPs ({current_allocated_mw/1000:.1f}W) exceeds total budget ({self.gpu_max_tdp_total_mw/1000:.1f}W). Cannot allocate more. Check config.")
-                         remaining_budget_mw = 0 # Cannot allocate more
-
-                    logging.debug(f"Initial min allocation: {current_allocated_mw / 1000:.1f} W. Remaining budget: {remaining_budget_mw / 1000:.1f} W.")
-
-                    # Distribute remaining budget to active GPUs in order of utilization
-                    for index, util in active_gpus:
-                        if remaining_budget_mw <= 0:
-                            break # No more budget to distribute
-
-                        current_limit = new_limits_mw[index]
-                        max_possible_for_gpu = self.gpu_max_tdp_limits_mw[index]
-                        potential_increase = max_possible_for_gpu - current_limit
-
-                        # How much can we actually give this GPU from the remaining budget?
-                        increase_amount = min(remaining_budget_mw, potential_increase)
-
-                        if increase_amount > 0:
-                            new_limits_mw[index] += increase_amount
-                            remaining_budget_mw -= increase_amount
-                            logging.debug(f"Allocated {increase_amount / 1000:.1f} W extra to active GPU {index} (Util: {util}%). Remaining budget: {remaining_budget_mw / 1000:.1f} W.")
+        return limits
 
 
-                # Apply the calculated limits (the function checks if changes are needed)
-                self._set_tdp_limits(new_limits_mw)
+    def passive_split(self) -> List[int]:
+        """Distribute total budget across all GPUs proportionally by max TDP, respecting min_tdp_w."""
+        max_tdp_sum = sum(self.tdp_max)
+        if max_tdp_sum <= 0: # Avoid division by zero
+             logging.warning("Sum of max TDPs is zero. Returning min_tdp_w for all.")
+             return [self.min_tdp_w] * self.gpu_count
 
-                # Wait for the next cycle
-                time.sleep(self.update_interval)
+        # Calculate initial proportional split
+        calculated_limits = [
+             int(self.max_total_tdp_w * self.tdp_max[i] / max_tdp_sum)
+             for i in range(self.gpu_count)
+        ]
 
-        except KeyboardInterrupt:
-            logging.info("Keyboard interrupt received.")
-        except Exception as e:
-            logging.exception(f"An unexpected error occurred in the main loop: {e}")
-        finally:
-            self.shutdown()
+        # Ensure minimum configured TDP is respected *after* proportional calculation
+        final_limits = [max(self.min_tdp_w, limit) for limit in calculated_limits]
 
-    def shutdown(self):
-        """Shuts down the NVML library and optionally resets TDP."""
-        logging.info("Shutting down GpuTdpBalancer...")
-        # Optionally: Reset TDP to default or initial state here
-        # For simplicity, we'll just log current state before shutdown
-        logging.info(f"Final TDP limits (W): { {k: v/1000 for k, v in self.last_tdp_limits_mw.items()} }")
+        # Adjust if applying min_tdp_w caused budget overrun
+        current_total = sum(final_limits)
+        if current_total > self.max_total_tdp_w:
+            logging.debug(f"Passive split after applying min_tdp_w exceeds budget ({current_total}W > {self.max_total_tdp_w}W). Attempting reduction.")
+            # Attempt to reduce those above min_tdp_w proportionally to fit budget
+            overbudget = current_total - self.max_total_tdp_w
+            reducible_sum = sum(final_limits[i] - self.min_tdp_w for i in range(self.gpu_count) if final_limits[i] > self.min_tdp_w)
+
+            if reducible_sum > 0:
+                temp_limits = list(final_limits) # Create copy to modify
+                for i in range(self.gpu_count):
+                    if final_limits[i] > self.min_tdp_w:
+                        reduction = int(overbudget * (final_limits[i] - self.min_tdp_w) / reducible_sum)
+                        temp_limits[i] = max(self.min_tdp_w, final_limits[i] - reduction)
+                final_limits = temp_limits # Update final_limits with reduced values
+                new_total = sum(final_limits)
+                logging.debug(f"Passive split reduced to {new_total}W to meet budget.")
+            else:
+                # Cannot reduce further, accept budget overrun (set_tdp_limits will clamp individually)
+                logging.warning(f"Passive split budget overrun ({current_total}W > {self.max_total_tdp_w}W) could not be fully corrected as all GPUs are at min TDP.")
+                # Limits remain as they are (floored up)
+
+        return final_limits
+
+    def run(self) -> None:
+        """Main control loop."""
+        logging.info("Starting GPU TDP Balancer loop...")
+        if not self._nvml_initialized or self.gpu_count == 0:
+            logging.error("Balancer cannot run: NVML not initialized or no GPUs found.")
+            self.running = False
+            return # Exit run method early
+
         try:
-            # Attempt to disable persistence mode if it was enabled - requires root
-            # This is often desired so settings don't stick after script exits
-            for i, handle in enumerate(self.handles):
-                 try:
-                     # Check if persistence mode was supported and potentially enabled
-                     # We didn't explicitly store if we succeeded per-GPU, so try disabling anyway
-                     # It's safer to attempt disable than leave it enabled if user doesn't want it
-                     mode = nvmlDeviceGetPersistenceMode(handle)
-                     if mode == NVML_FEATURE_ENABLED:
-                        nvmlDeviceSetPersistenceMode(handle, NVML_FEATURE_DISABLED)
-                        logging.debug(f"Disabled persistence mode for GPU {i}.")
-                 except NVMLError as e:
-                     # Ignore errors if not supported or no permission, log others
-                     if e.value not in [NVML_ERROR_NOT_SUPPORTED, NVML_ERROR_NO_PERMISSION]:
-                          logging.warning(f"Could not disable persistence mode for GPU {i}: {e}")
+            while self.running:
+                try:
+                    # --- Start of error-handled block for one update cycle ---
+                    usages, cur_limits = self.get_loads_and_limits()
+                    logging.debug(f"GPU usages: {usages} %, Current Power limits: {cur_limits} W")
 
-            nvmlShutdown()
-            logging.info("NVML shut down successfully.")
-        except NVMLError as error:
-            logging.error(f"Failed to shut down NVML: {error}")
+                    is_any_active = any(u >= self.active_level for u in usages)
+                    is_all_passive = all(u < self.passive_level for u in usages)
+
+                    new_limits: List[int] = []
+                    state: str = ""
+
+                    if is_any_active:
+                        # ACTIVE state: At least one GPU is heavily utilized
+                        state = "ACTIVE"
+                        new_limits = self.active_split(usages)
+                    elif is_all_passive:
+                        # PASSIVE state: All GPUs are below the passive threshold
+                        state = "PASSIVE"
+                        new_limits = self.passive_split()
+                    else:
+                        state = "TRANSITION"
+                        new_limits = self.passive_split()
+
+                    # Check if state or calculated target limits have changed since last cycle
+                    target_limits_changed = new_limits != self._last_target_limits # Compare with previous *target*
+                    state_changed = state != self._last_state
+
+                    # Log state changes or if *calculated* target limits changed
+                    if state_changed or target_limits_changed:
+                         logging.info(f"Balancer state: {state}. Target limits: {new_limits} W")
+                    # Log at DEBUG level if neither state nor calculated target limits changed
+                    elif logging.getLogger().isEnabledFor(logging.DEBUG):
+                         log_msg = f"Balancer state: {state}. Target limits: {new_limits} W (No change calculated)."
+                         # Optionally add current limits info if they differ from target (useful for debug)
+                         if new_limits != cur_limits:
+                              log_msg += f" Current HW limits: {cur_limits} W."
+                         logging.debug(log_msg)
+
+                    self._last_state = state # Store state for next iteration comparison
+                    self._last_target_limits = new_limits # Store calculated limits for next iteration
+
+                    # Set limits, passing current limits for comparison inside the function
+                    # set_tdp_limits handles clamping and only calls nvml if needed
+                    self.set_tdp_limits(new_limits, cur_limits)
+
+                except NVMLError as e:
+                    logging.error(f"NVML error during update cycle: {e}. Skipping this update.")
+                    # Optional: Add a small delay here if errors are frequent and persistent
+                    # time.sleep(self.interval * 2)
+                except Exception as e:
+                     # Catch unexpected errors within the loop to prevent crashing the balancer
+                     logging.exception(f"Unexpected error during update cycle: {e}. Skipping this update.")
+
+
+                # Wait for the next interval regardless of success or error in this cycle
+                if self.running: # Check running flag again before sleeping
+                    time.sleep(self.interval)
+
+        finally:
+            logging.info("Exiting balancer loop.")
+            self.running = False # Explicitly set running to False
+            self.shutdown() # Ensure NVML resources are released
+
+    def shutdown(self) -> None:
+        """Shuts down NVML cleanly."""
+        # Check if NVML was initialized successfully before trying to shut down
+        if hasattr(self, '_nvml_initialized') and self._nvml_initialized:
+            try:
+                nvmlShutdown()
+                logging.info("NVML shutdown complete.")
+                self._nvml_initialized = False # Mark as shut down
+            except NVMLError as e:
+                # Log NVMLError specifically during shutdown
+                logging.warning(f"NVML error during shutdown: {e}")
+            except Exception as e:
+                # Catch any other unexpected errors during shutdown
+                logging.error(f"Unexpected error during NVML shutdown: {e}")
+        else:
+            logging.debug("NVML shutdown skipped (was not initialized or already shut down).")

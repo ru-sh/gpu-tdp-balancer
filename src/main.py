@@ -27,7 +27,7 @@ def main():
     )
     parser.add_argument(
         "--min-gpu-tdp", type=int, default=100,
-        help="Minimum TDP limit for any single GPU (Watts). Default: 100W"
+        help="Minimum TDP limit for any single GPU (Watts). Default: 100W (NVML min value)"
     )
     parser.add_argument(
         "--active-level", type=int, default=20,
