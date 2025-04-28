@@ -78,7 +78,7 @@ You can run the balancer inside a Docker container using the NVIDIA Container To
 - NVIDIA Container Toolkit installed on the host. Follow the official guide: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 
 ```bash
-docker run --rm --gpus all --cap-add=SYS_ADMIN shakirovruslan/gpu-tdp-balancer [OPTIONS]
+docker run --gpus all --cap-add=SYS_ADMIN --restart=unless-stopped --name=gpu-tdp-balancer shakirovruslan/gpu-tdp-balancer [OPTIONS]
 ```
 
 ### Build the Docker Image
